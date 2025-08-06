@@ -1,7 +1,7 @@
 from rag.pipeline.language_model import LM, LMConfig
 from rag.retriever.langchain_retriever import LangChainRetriever
 from rag.inference.inferencer import Inferencer, InferencerConfig
-from rag.agents.customer_service_agent import CSAgent
+from rag.agents.chatbot_agent import ChatbotAgent
 from rag.agents.query_maker_agent import QueryMakerAgent
 from langchain_core.documents import Document
 from rag.web_search.duckduckgo_search import DuckDuckGoSearch
@@ -60,7 +60,7 @@ ddgs = DuckDuckGoSearch()
 cs_inferencer = Inferencer(
         model=llm,
         retriever=document_retriever,
-        # search_engine = ddgs,
+        search_engine = ddgs,
         reranker=None,
         config=inferencer_config
 )
@@ -70,9 +70,9 @@ query_maker_inferencer = Inferencer(
         config=inferencer_config
 )
 
-cs_agent = CSAgent(
+cs_agent = ChatbotAgent(
     inferencer = cs_inferencer,
-    prompt_template = get_chat_template("customer_service")
+    prompt_template = get_chat_template("chatbot")
 )
 
 query_maker_chat_template = get_chat_template("query_maker")
