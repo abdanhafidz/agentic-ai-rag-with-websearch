@@ -1,6 +1,8 @@
 from rag.retriever.langchain_retriever import LangChainRetriever
-from rag.pipeline.qwen_llm import QwenLLM, QwenConfig
+from rag.pipeline.language_model import LM, LMConfig
 from rag.retriever.retriever_types import RetrievalResult
+from rag.web_search.duckduckgo_search import DuckDuckGoSearch
+from langchain_core.documents import Document
 # from rag.pipeline.reranker import BGEM3Reranker
 from typing import List, Union, Dict, Any, Optional, AsyncGenerator
 import asyncio
@@ -29,15 +31,16 @@ class Inferencer:
     """
     
     def __init__(self, 
-                 model: QwenLLM, 
-                 retriever: LangChainRetriever, 
+                 model: LM, 
+                 retriever: LangChainRetriever = None, 
+                 search_engine = None,
                  reranker=None,
                  config: Optional[InferencerConfig] = None):
         """
         Initialize Inferencer
         
         Args:
-            model: QwenLLM instance
+            model: LM instance
             retriever: LangChainRetriever instance
             reranker: Reranker instance (optional)
             config: InferencerConfig (optional)
@@ -45,6 +48,7 @@ class Inferencer:
         self.model = model
         self.retriever = retriever
         self.reranker = reranker
+        self.search_engine = search_engine
         self.config = config or InferencerConfig()
         
         # Setup logging
@@ -85,6 +89,7 @@ class Inferencer:
         try:
             start_time = datetime.now()
             contexts = await self.retriever.retrieve(query, k=k)
+            self.logger.info(f"Retrieved Contexts : {contexts}")
             retrieval_time = (datetime.now() - start_time).total_seconds()
             
             self.logger.info(f"Retrieved {len(contexts.documents) if hasattr(contexts, 'documents') else len(contexts)} contexts in {retrieval_time:.2f}s")
@@ -262,7 +267,7 @@ class Inferencer:
     async def generate_response_stream(self, 
                                      contexts: RetrievalResult, 
                                      query: str,
-                                     template_type: str = "friendly",
+                                     template_type: str = "main_template",
                                      max_new_tokens: Optional[int] = None,
                                      **generation_kwargs) -> AsyncGenerator[str, None]:
         """
@@ -292,7 +297,7 @@ class Inferencer:
             yield chunk
     
     async def infer(self, 
-                   query: Union[str, List[str]], 
+                   query: str, 
                    response_type: Union[List[str], str] = None,
                    k: Optional[int] = None,
                    enable_reranking: Optional[bool] = None,
@@ -321,8 +326,12 @@ class Inferencer:
         
         try:
             # Step 1: Retrieve contexts
-            retrieved_contexts = await self.retrieve_context(main_query, k=k)
-            
+            if(self.search_engine):
+                await self.retrieve_from_search_engine(query, k = k)
+            if(self.retriever):
+                retrieved_contexts = await self.retrieve_context(main_query, k=k)
+            else:
+                retrieved_contexts  = ""
             # Step 2: Rerank contexts (if enabled)
             enable_rerank = enable_reranking if enable_reranking is not None else self.config.enable_reranking
             if enable_rerank:
@@ -363,12 +372,39 @@ class Inferencer:
         except Exception as e:
             self.logger.error(f"Error during inference: {e}")
             raise
-    
+    async def retrieve_from_search_engine(self, query: str, k: int = 3):
+        """
+        Alternative method: Process results as they come
+        """
+        from langchain_core.documents import Document
+        
+        search_results = []
+        
+        try:
+            # Process results one by one as they come
+            async for result in self.search_engine.search(query, max_results=k):
+                self.logger.info(f"Processing SEO Result: {result[:100]}...")
+                
+                doc = Document(
+                    page_content=result,
+                    metadata={"source": "internet_search", "query": query}
+                )
+                search_results.append(doc)
+                
+                # Optionally add to retriever immediately
+                await self.retriever.add_documents([doc])
+            
+            self.logger.info(f"Processed {len(search_results)} search results")
+            return search_results
+            
+        except Exception as e:
+            self.logger.error(f"Error in retrieve_from_search_engine_alternative: {e}", exc_info=True)
+            raise
     async def infer_stream(self, 
                           query: str,
                           k: Optional[int] = None,
                           enable_reranking: Optional[bool] = None,
-                          template_type: str = "system",
+                          template_type: str = "main_template",
                           max_new_tokens: Optional[int] = None,
                           **generation_kwargs) -> AsyncGenerator[Dict[str, Any], None]:
         """
@@ -389,8 +425,14 @@ class Inferencer:
         
         try:
             # Step 1: Retrieve contexts
-            retrieved_contexts = await self.retrieve_context(query, k=k)
+            if(self.search_engine):
+                await self.retrieve_from_search_engine(query, k = k)
+            if(self.retriever is not None):
+                retrieved_contexts = await self.retrieve_context(query, k=k)
+            else:
+                retrieved_contexts = ""
             
+
             # Step 2: Rerank contexts (if enabled)
             enable_rerank = enable_reranking if enable_reranking is not None else self.config.enable_reranking
             if enable_rerank:

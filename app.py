@@ -1,70 +1,15 @@
-
-
-import warnings
-warnings.filterwarnings("ignore")
-import asyncio
-
 import gradio as gr
 import asyncio
-from pipeline.qwen_llm import QwenLLM, QwenConfig
-from retriever.langchain_retriever import LangChainRetriever
-from inference.inferencer import InferencerConfig, Inferencer
-
-async def test_inference():
+from rag.pipeline.language_model import LM, LMConfig
+from rag.retriever.langchain_retriever import LangChainRetriever
+from rag.inference.inferencer import InferencerConfig, Inferencer
+from rag import cs_agent, query_maker_agent
+def main():
     """Main function that sets up and runs the RAG chatbot interface"""
     
     # Initialize RAG components
     print("==== Start Inference Test ===")
     
-    # Setup LLM
-    config = QwenConfig(
-        temperature=0.3,
-        max_length=512,
-        generation_timeout=9999999.9,
-        repetition_penalty=1.1
-    )
-    
-    llm = QwenLLM(config=config)
-
-    # Setup Document Retriever
-    document_retriever = LangChainRetriever(
-        embedding_model="text-embedding-3-small",
-        vectorstore_type="chroma",
-        vectorstore_path="./vectorstore",
-        use_hybrid_search=True,
-        chunk_size=1000, 
-        chunk_overlap=200
-    )
-
-    # Load initial documents
-    file_paths = [
-        "../documents/file2.pdf",
-    ]
-    
-    for file_path in file_paths:
-        try:
-            result = await document_retriever.add_document_from_file(file_path)
-            if result.success:
-                print(f"Successfully processed: {result.document_metadata.file_name}")
-                print(f"Chunks created: {result.document_metadata.chunk_count}")
-            else:
-                print(f"Failed to process: {result.error_message}")
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
-
-    # Setup Inferencer
-    inferencer_config = InferencerConfig(
-        default_k=2,
-        enable_reranking=False,
-        default_template_types=["system", "friendly", "instruction"]
-    )
-    
-    inferencer = Inferencer(
-        model=llm,
-        retriever=document_retriever,
-        reranker=None,
-        config=inferencer_config
-    )
     
     print("RAG system initialized successfully!")
 
@@ -74,15 +19,13 @@ async def test_inference():
             # Create new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
+
             async def stream_response():
                 partial_response = ""
-                
-                async for stream_data in inferencer.infer_stream(
-                    query=message,
-                    k=3,
-                    template_type="friendly"
-                ):
+                formatted_query = await query_maker_agent.get_result(question = message)
+                formatted_query = formatted_query['responses'][0]['rag_response']
+                await cs_agent.load_documents()
+                async for stream_data in cs_agent.get_result(question = message):
                     print(stream_data)
                     if stream_data["type"] == "chunk":
                         chunk = stream_data["data"]["chunk"]
@@ -122,7 +65,7 @@ async def test_inference():
             asyncio.set_event_loop(loop)
             
             async def add_doc():
-                result = await document_retriever.add_document_from_file(file_path)
+                result = ""
                 return result
             
             result = loop.run_until_complete(add_doc())
@@ -159,8 +102,7 @@ async def test_inference():
     # Membuat interface Gradio
     with gr.Blocks(css=css, title="RAG Chatbot") as demo:
         gr.Markdown("""
-        # 🤖 RAG Chatbot dengan Text Streaming
-        Chatbot berbasis Retrieval-Augmented Generation (RAG) dengan dukungan streaming response.
+        # 🤖 Agentic RAG
         """)
         
         # Status indicator
@@ -298,7 +240,7 @@ async def test_inference():
         )
         
         # Info panel
-        with gr.Accordion("ℹ️ Info Penggunaan", open=False):
+        with gr.Accordion(" Info Penggunaan", open=False):
             gr.Markdown("""
             ### Cara Menggunakan:
             1. **Chat**: Ketik pertanyaan tentang dokumen yang sudah dimuat
@@ -327,13 +269,5 @@ async def test_inference():
         show_api=False
     )
 
-
-def run_test():
-    try:
-        # await test_document_retriever()
-        # await test_qwen_llm()
-        asyncio.run(test_inference())
-    except Exception as e:
-        print(e)
-
-run_test()
+if __name__== "main":
+    main()

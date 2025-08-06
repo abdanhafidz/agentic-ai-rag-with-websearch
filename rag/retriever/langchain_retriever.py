@@ -6,6 +6,7 @@ from langchain_openai import OpenAIEmbeddings
 
 # Vector stores
 from langchain_community.vectorstores import Chroma, FAISS, Pinecone
+from langchain.retrievers import EnsembleRetriever
 
 # Retriever base
 from langchain_core.vectorstores import VectorStoreRetriever
@@ -160,17 +161,33 @@ class LangChainRetriever(BaseRetriever):
         except Exception as e:
             logger.error(f"Error adding documents: {str(e)}")
             return False
-
     async def _update_bm25_retriever(self, documents: List[Document]):
         try:
+            # Create BM25 retriever from documents
             self.bm25_retriever = BM25Retriever.from_documents(documents)
-            self.retriever = ContextualCompressionRetriever(
-                base_compressor=None,  # Optional: add compressor like CohereRerank or LLM-based
-                base_retriever=self.bm25_retriever  # Example: use BM25 as base, can combine
+            self.bm25_retriever.k = 10  # Set number of documents to retrieve
+            
+            # For hybrid search, you have several options:
+            
+            # Option 1: Use only BM25 retriever (simplest fix)
+            self.retriever = self.bm25_retriever
+            
+            vector_retriever = VectorStoreRetriever(
+                vectorstore=self.vectorstore,
+                search_kwargs={"k": 10}
             )
+            self.retriever = EnsembleRetriever(
+                retrievers=[vector_retriever, self.bm25_retriever],
+                weights=[0.5, 0.5]  # Equal weight to both retrievers
+            )
+            
         except Exception as e:
             logger.error(f"Error updating BM25 retriever: {str(e)}")
-
+            # Fallback to vector retriever only
+            self.retriever = VectorStoreRetriever(
+                vectorstore=self.vectorstore,
+                search_kwargs={"k": 10}
+            )
     async def retrieve(self, query: str, k: int = 5) -> RetrievalResult:
         try:
             import time

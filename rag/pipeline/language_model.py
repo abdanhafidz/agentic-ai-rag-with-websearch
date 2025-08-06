@@ -1,6 +1,7 @@
 import torch
 import asyncio
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, TextIteratorStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, TextIteratorStreamer, BitsAndBytesConfig
+import torch
 from typing import Optional, Dict, Any, List, Union, Callable, Awaitable, AsyncGenerator
 import logging
 from dataclasses import dataclass
@@ -8,14 +9,13 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from threading import Thread
-from rag.prompt_tuner.chat_template import RAG_TEMPLATES
 from rag.retriever.retriever_types import RetrievalResult
 from langchain_core.documents import Document
+import copy
 
 @dataclass
-class QwenConfig:
-    """Konfigurasi untuk model Qwen 0.5B"""
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+class LMConfig:
+    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     device: str = "cuda"
     torch_dtype: torch.dtype = torch.float16
     max_length: int = 2048
@@ -23,6 +23,7 @@ class QwenConfig:
     top_p: float = 0.8
     top_k: int = 50
     do_sample: bool = True
+    quantization_config: any = None
     pad_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
     # RAG-specific configs
@@ -31,28 +32,34 @@ class QwenConfig:
     instruction_template: str = "system"  # "system", "instruction", "custom"
     # Async-specific configs
     max_workers: int = 2
-    generation_timeout: float = 9999999.0
+    generation_timeout: float = 30
     repetition_penalty: float = 1.0
     # Streaming-specific configs
-    stream_timeout: float = 10  # timeout untuk stream chunk
+    stream_timeout: float = 100  # timeout untuk stream chunk
     skip_prompt: bool = True     # skip prompt dari streaming output
 
-class QwenLLM:
+class LM:
     """
     Async LLM Qwen 0.5B dengan interface yang mudah digunakan
     Termasuk prompt formatting khusus untuk RAG (Retrieval-Augmented Generation)
     Dan support untuk text streaming
     """
     
-    def __init__(self, config: Optional[QwenConfig] = None, rag_templates = RAG_TEMPLATES()):
+    def __init__(self, config: Optional[LMConfig] = None, prompt_template = [
+                 {"role": "system", "content": "You are a helpful assistant."},
+                 {"role": "user", "content": "{question}"}
+            ] ):
         """
-        Inisialisasi QwenLLM
+        Inisialisasi LM
         
         Args:
             config: Konfigurasi model (optional, akan menggunakan default jika None)
         """
-        self.config = config or QwenConfig()
-        self.tokenizer = None
+        if(config is None):
+            self.config = LMConfig()
+        else:
+            self.config = config
+        self.tokenizer : AutoTokenizer = None
         self.model = None
         self.generation_config = None
         self.is_loaded = False
@@ -63,7 +70,7 @@ class QwenLLM:
         self.logger = logging.getLogger(__name__)
         
         # RAG prompt templates
-        self.rag_templates = rag_templates
+        self.prompt_template = prompt_template
     
     async def load_model(self) -> None:
         """Load model dan tokenizer secara async"""
@@ -80,7 +87,9 @@ class QwenLLM:
                     self.executor,
                     lambda: AutoTokenizer.from_pretrained(
                         self.config.model_name,
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        torch_dtype="auto",
+                        device_map="auto",
                     )
                 )
                 
@@ -89,6 +98,7 @@ class QwenLLM:
                     self.executor,
                     lambda: AutoModelForCausalLM.from_pretrained(
                         self.config.model_name,
+                        quantization_config=self.config.quantization_config,
                         torch_dtype=self.config.torch_dtype,
                         device_map=self.config.device,
                         trust_remote_code=True
@@ -121,7 +131,7 @@ class QwenLLM:
         Returns:
             List of available template names
         """
-        return list(self.rag_templates.keys())
+        return list(self.prompt_template)
     
     def preview_template(self, template_type: str, sample_question: str = "Apa itu AI?", 
                         sample_context: str = "Artificial Intelligence adalah teknologi...") -> str:
@@ -136,13 +146,13 @@ class QwenLLM:
         Returns:
             Preview of formatted template
         """
-        if template_type not in self.rag_templates:
+        if template_type not in self.prompt_template:
             return f"Template '{template_type}' tidak tersedia. Available: {self.get_available_templates()}"
         
-        template_data = self.rag_templates[template_type]
-        template_key = "user_template" if "user_template" in template_data else "template"
+        template_data = copy.deepcopy(self.prompt_template)
+        # template_key = "user_template" if "user_template" in template_data else "template"
         
-        return template_data[template_key].format(
+        return template_data["content"].format(
             context=sample_context,
             question=sample_question
         )
@@ -162,6 +172,8 @@ class QwenLLM:
             return ""
         
         formatted_contexts = []
+        self.logger.info(f"Context : {contexts}")
+        self.logger.info(f"Is RetrievalResult Contexts =  {isinstance(contexts, RetrievalResult)}")
         if isinstance(contexts, RetrievalResult):
                 for i, ctx in enumerate(contexts.documents, 1):
                     if numbering:
@@ -215,6 +227,7 @@ class QwenLLM:
         """
         
         def _format_sync():
+            
             # Handle RetrievalResult secara eksplisit
             if isinstance(contexts, RetrievalResult):
                 docs = contexts.documents
@@ -246,8 +259,8 @@ class QwenLLM:
                 for i, doc in enumerate(processed_contexts.documents, 1):
                     if hasattr(doc, "metadata") and doc.metadata:
                         metadata_info.append(f"Dokumen {i}: {doc.metadata}")
-                if metadata_info:
-                    formatted_context += f"\n\n[Metadata]\n" + "\n".join(metadata_info)
+                # if metadata_info:
+                #     formatted_context += f"\n\n[Metadata]\n" + "\n".join(metadata_info)
 
             return formatted_context
 
@@ -255,29 +268,67 @@ class QwenLLM:
         formatted_context = await asyncio.get_event_loop().run_in_executor(
             self.executor, _format_sync
         )
-
+        self.logger.info(f"Formatted Context {formatted_context}")
         # Tentukan template yang akan dipakai
-        template_type = template_type or self.config.instruction_template
-
+        if(template_type == ""):
+            self.config.instruction_template = "system"
         # Gunakan custom template jika disediakan
         if custom_template:
             return custom_template.format(
                 context=formatted_context,
                 question=question
             )
-        elif template_type in self.rag_templates:
-            template_data = self.rag_templates[template_type]
-            template_key = "user_template" if "user_template" in template_data else "template"
-            return template_data[template_key].format(
-                context=formatted_context,
-                question=question
-            )
+        elif self.prompt_template:
+            print("question", question)
+           
+            template_data = copy.deepcopy(self.prompt_template)
+            print("template = ", template_type, "rag template = ", template_data)
+            # template_key = "user_template" if "user_template" in template_data else "template"
+
+            formatted_template = []
+            for cht in template_data:
+                    # Create a copy of the content to avoid modifying the original
+                content = cht["content"]
+                
+                # Format both placeholders at once to avoid KeyError
+                if "{context}" in content or "{question}" in content:
+                    try:
+                        content = content.format(
+                            context=formatted_context,
+                            question=question
+                        )
+                    except KeyError as e:
+                        self.logger.error(f"Missing placeholder in template: {e}")
+                        # Fallback: format only available placeholders
+                        if "{context}" in content:
+                            content = content.replace("{context}", formatted_context)
+                        if "{question}" in content:
+                            content = content.replace("{question}", question)
+                
+                # Create new dict with formatted content
+                formatted_chat = {
+                    "role": cht["role"],
+                    "content": content
+                }
+                
+                # Copy other fields if they exist
+                if "description" in cht:
+                    formatted_chat["description"] = cht["description"]
+                    
+                formatted_template.append(formatted_chat)
+
+            # self.logger.info(f"Formatted Template {formatted_template}")
+            # print("Forrmatted Template", formatted_template)
+            return formatted_template
         else:
             # Fallback default template
-            return f"Konteks: {formatted_context}\n\nPertanyaan: {question}\n\nJawaban:"
+            return [
+                 {"role": "system", "content": "You are a helpful assistant."},
+                 {"role": "user", "content": question}
+            ]
 
     async def generate_stream(self, 
-                             prompt: str, 
+                             prompt: List[Dict], 
                              max_new_tokens: Optional[int] = None,
                              temperature: Optional[float] = None,
                              top_p: Optional[float] = None,
@@ -308,7 +359,11 @@ class QwenLLM:
         def _generate_sync():
             try:
                 # Tokenize input
-                inputs = self.tokenizer(prompt, return_tensors="pt")
+                inputs = self.tokenizer.apply_chat_template(
+                    prompt,
+                    add_generation_prompt=True,
+                    return_tensors="pt"
+                )
                 
                 # Override generation config jika diperlukan
                 gen_config = self.generation_config
@@ -327,7 +382,7 @@ class QwenLLM:
                 
                 # Move to GPU
                 self.model.to("cuda")
-                input_ids = inputs.input_ids.to("cuda")
+                input_ids = inputs.to("cuda")
                 
                 # Generate dalam thread terpisah
                 generation_kwargs = {
@@ -350,7 +405,7 @@ class QwenLLM:
         generation_thread = await asyncio.get_event_loop().run_in_executor(
             self.executor, _generate_sync
         )
-        
+        err = None
         try:
             # Stream tokens
             for token in streamer:
@@ -358,12 +413,12 @@ class QwenLLM:
                     yield token
                     
             # Wait for generation thread to finish
-            await asyncio.get_event_loop().run_in_executor(
+            err = await asyncio.get_event_loop().run_in_executor(
                 self.executor, generation_thread.join
             )
             
         except Exception as e:
-            self.logger.error(f"Error during streaming: {e}")
+            self.logger.error(f"Error during streaming: {e}, {err}")
             # Make sure thread is cleaned up
             if generation_thread.is_alive():
                 generation_thread.join(timeout=1.0)
@@ -640,7 +695,7 @@ class QwenLLM:
             raise RuntimeError("Model belum di-load. Panggil await load_model() terlebih dahulu.")
     
     async def generate(self, 
-                      prompt: str, 
+                      prompt: Union[List[Dict], str], 
                       max_new_tokens: Optional[int] = None,
                       temperature: Optional[float] = None,
                       top_p: Optional[float] = None,
@@ -658,12 +713,17 @@ class QwenLLM:
         Returns:
             Generated text
         """
+        
         await self._check_model_loaded()
         
         def _generate_sync():
             try:
                 # Tokenize input
-                inputs = self.tokenizer(prompt, return_tensors="pt")
+                inputs = self.tokenizer.apply_chat_template(
+                    prompt,
+                    add_generation_prompt=True,
+                    return_tensors="pt"
+                )
                 
                 # Override generation config jika diperlukan
                 gen_config = self.generation_config
@@ -684,8 +744,8 @@ class QwenLLM:
                 with torch.no_grad():
                     
                     self.model.to("cuda")
-                    input_ids = inputs.input_ids.to("cuda")
-
+                    input_ids = inputs.to("cuda")
+                    prompt_length = input_ids.shape[-1]
                     outputs = self.model.generate(
                         input_ids,
                         generation_config=gen_config,
@@ -694,14 +754,12 @@ class QwenLLM:
                 
                 # Decode output
                 generated_text = self.tokenizer.decode(
-                    outputs[0], 
+                    outputs[0][prompt_length:], 
                     skip_special_tokens=True
                 )
-                
+
+                print("Generated Text", generated_text)
                 # Remove input prompt dari output
-                if generated_text.startswith(prompt):
-                    generated_text = generated_text[len(prompt):].strip()
-                
                 return generated_text
                 
             except Exception as e:
@@ -741,8 +799,8 @@ class QwenLLM:
                 # Format messages untuk chat
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     messages,
-                    tokenize=False,
-                    add_generation_prompt=True
+                    chat_template="rag",
+                    return_tensors="pt"
                 )
                 return formatted_prompt
                 
@@ -862,7 +920,7 @@ class QwenLLM:
         """
         Cleanup resources secara async
         """
-        self.logger.info("Closing QwenLLM...")
+        self.logger.info("Closing LM...")
         
         # Shutdown executor
         self.executor.shutdown(wait=True)
@@ -877,7 +935,7 @@ class QwenLLM:
             torch.cuda.empty_cache()
         
         self.is_loaded = False
-        self.logger.info("QwenLLM closed successfully")
+        self.logger.info("LM closed successfully")
     
     async def __aenter__(self):
         """Async context manager entry"""
